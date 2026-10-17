@@ -3,6 +3,7 @@ import os
 import tempfile
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
 from langchain_core.tools import tool
 
@@ -94,23 +95,31 @@ def make_tools(session):
             session.store_result("mine_patterns_tool", {"category_name": category_name}, summary)
             return summary
 
-        dtm_dense = dtm_local.toarray()
+        # Ensure CSR format for efficient sparse operations
+        X_sparse = sp.csr_matrix(dtm_local)
 
-        # Step 2: Apply chosen filtering_method
+        # Step 2: Apply chosen filtering_method using sparse operations
         if filtering_method == "variance":
-            scores = np.var(dtm_dense, axis=0)
+            # Variance = E[X^2] - (E[X])^2 computed directly on sparse CSR columns
+            mean_x = np.array(X_sparse.mean(axis=0)).ravel()
+            mean_x2 = np.array(X_sparse.power(2).mean(axis=0)).ravel()
+            scores = mean_x2 - (mean_x ** 2)
             low_p, high_p = np.percentile(scores, 5), np.percentile(scores, 95)
             keep_mask = (scores >= low_p) & (scores <= high_p)
+
         elif filtering_method == "term_frequency":
-            scores = np.sum(dtm_dense, axis=0)
+            # Sum of term counts across documents directly on sparse matrix
+            scores = np.array(X_sparse.sum(axis=0)).ravel()
             low_p, high_p = np.percentile(scores, 5), np.percentile(scores, 95)
             keep_mask = (scores >= low_p) & (scores <= high_p)
+
         elif filtering_method == "tfidf":
             transformer = TfidfTransformer()
-            tfidf_mat = transformer.fit_transform(dtm_dense).toarray()
-            scores = np.mean(tfidf_mat, axis=0)
+            tfidf_mat = transformer.fit_transform(X_sparse)
+            scores = np.array(tfidf_mat.mean(axis=0)).ravel()
             p20 = np.percentile(scores, 20)
             keep_mask = scores >= p20
+
         else:
             return {
                 "status": "error",
@@ -118,7 +127,7 @@ def make_tools(session):
             }
 
         kept_features = feature_names[keep_mask]
-        kept_dtm = dtm_dense[:, keep_mask]
+        kept_dtm = X_sparse[:, keep_mask]
 
         # Step 3: Handle zero-surviving terms
         if len(kept_features) == 0:
@@ -138,11 +147,21 @@ def make_tools(session):
             }, summary)
             return summary
 
-        # Step 4: Write transactional database file for PAMI
+        # Step 4: Write transactional database file for PAMI efficiently using CSR pointers
         # One transaction per document with count >= 1
+        indptr = kept_dtm.indptr
+        indices = kept_dtm.indices
+        data = kept_dtm.data
+
         transactions = []
-        for row in kept_dtm:
-            present_terms = [kept_features[j] for j in range(len(kept_features)) if row[j] >= 1]
+        for i in range(kept_dtm.shape[0]):
+            row_start = indptr[i]
+            row_end = indptr[i + 1]
+            row_indices = indices[row_start:row_end]
+            row_data = data[row_start:row_end]
+
+            # Collect terms with count >= 1 in this row
+            present_terms = [kept_features[col_idx] for col_idx, val in zip(row_indices, row_data) if val >= 1]
             if present_terms:
                 transactions.append("\t".join(present_terms))
 
@@ -163,7 +182,12 @@ def make_tools(session):
             }, summary)
             return summary
 
-        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as tmp_file:
+        with tempfile.NamedTemporaryFile(
+            mode="w+",
+            encoding="utf-8",
+            delete=False,
+            suffix=".txt"
+        ) as tmp_file:
             tmp_filename = tmp_file.name
             for t in transactions:
                 tmp_file.write(t + "\n")
@@ -185,7 +209,6 @@ def make_tools(session):
                 miner.mine()
                 df_res = miner.getPatternsAsDataFrame()
             else:
-                os.remove(tmp_filename)
                 return {
                     "status": "error",
                     "error": f"Invalid algorithm '{algorithm}'. Choose 'fpgrowth', 'topk', or 'maxfpgrowth'."
@@ -203,23 +226,43 @@ def make_tools(session):
                         "pattern": items,
                         "support": sup_val
                     })
+
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": f"PAMI pattern mining execution failed: {str(e)}"
+            }
+
         finally:
             if os.path.exists(tmp_filename):
                 os.remove(tmp_filename)
 
-        # Store pattern list in session.artifacts
+        # Store complete original pattern list in session.artifacts and full_report
         artifact_key = f"patterns_{category_name}_{filtering_method}_{algorithm}"
         session.artifacts[artifact_key] = patterns_list
 
         result_id = session.next_result_id("patterns")
+        n_patterns = len(patterns_list)
+
+        # For summary returned to LLM, limit to top 20 patterns sorted by descending support
+        if n_patterns <= 20:
+            patterns_summary = patterns_list
+            note = None
+        else:
+            sorted_patterns = sorted(patterns_list, key=lambda x: x["support"], reverse=True)
+            patterns_summary = sorted_patterns[:20]
+            note = f"Returned top 20 of {n_patterns} total patterns by support. Full pattern list saved in session.artifacts['{artifact_key}']"
+
         summary = {
             "result_id": result_id,
             "category_name": category_name,
             "filtering_method": filtering_method,
             "algorithm": algorithm,
-            "n_patterns": len(patterns_list),
-            "patterns": patterns_list
+            "n_patterns": n_patterns,
+            "patterns": patterns_summary
         }
+        if note:
+            summary["note"] = note
 
         session.store_result(
             "mine_patterns_tool",
@@ -230,7 +273,8 @@ def make_tools(session):
                 "min_sup": min_sup,
                 "k": k
             },
-            summary
+            summary,
+            full_report=patterns_list
         )
 
         return summary
